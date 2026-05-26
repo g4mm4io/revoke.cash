@@ -1,10 +1,10 @@
 import { ChainId } from '@revoke.cash/chains';
 import { AGW_SESSIONS_ABI, ERC721_ABI, PERMIT2_ABI } from 'lib/abis';
 import eventsDB from 'lib/databases/events';
-import ky from 'lib/ky';
+
 import { getLogsProvider } from 'lib/providers';
 import { addressToTopic, isNullish, sortTokenEventsChronologically } from 'lib/utils';
-import { createViemPublicClientForChain, type DocumentedChainId, getChainApiUrl, getChainName } from 'lib/utils/chains';
+import { createViemPublicClientForChain, type DocumentedChainId, getChainName } from 'lib/utils/chains';
 import {
   generatePatchedAllowanceEvents,
   parseApprovalForAllLog,
@@ -40,16 +40,28 @@ export const getTokenEvents = async (chainId: DocumentedChainId, address: Addres
 type TokenEventsGetter = (chainId: DocumentedChainId, address: Address) => Promise<TokenEvent[]>;
 
 const ChainOverrides: Record<number, TokenEventsGetter> = {
-  // For pulsechain we want to check whether an account has transacted after the fork timestamp,
+  // For PulseChain we check whether an account has sent any transactions after the Ethereum fork,
   // since otherwise everyone that used Ethereum before the fork would have to wait to get their events.
-  // Note: this doesn't work 100% for smart contract addresses, but the trade-off is worth it.
+  // We compare the current nonce against the nonce at the fork block (17233000), since the fork
+  // copied all Ethereum state including nonces. If the nonce hasn't changed, the account hasn't
+  // been active on PulseChain.
+  // Note: this doesn't detect accounts that only *received* transactions after the fork, but the
+  // trade-off is worth it.
   [ChainId.PulseChain]: async (chainId, address) => {
-    const apiUrl = getChainApiUrl(chainId);
-    const pulsechainForkBlock = 17233000;
-    const url = `${apiUrl}?module=account&action=txlist&address=${address}&start_block=${pulsechainForkBlock}`;
+    const forkBlock = 17233000;
+    const publicClient = createViemPublicClientForChain(chainId);
 
-    const { result } = await ky.get(url).json<{ result: any[] | string }>();
-    if (!Array.isArray(result) || result.length === 0) return [];
+    // If the RPC doesn't support historical nonce queries, fall through to default event fetching
+    try {
+      const [currentNonce, forkNonce] = await Promise.all([
+        publicClient.getTransactionCount({ address }),
+        publicClient.getTransactionCount({ address, blockNumber: BigInt(forkBlock) }),
+      ]);
+
+      if (currentNonce === forkNonce) return [];
+    } catch {
+      console.log(`${getChainName(chainId)}: Historical nonce check failed, falling through to full event fetch`);
+    }
 
     return getTokenEventsDefault(chainId, address);
   },
